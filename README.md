@@ -149,6 +149,10 @@ For headful capability runs locally: `npm run playwright:install` once, then use
 | Domain allowlist | Schema only — not enforced yet |
 | 30-day raw event retention | Schema only — no purge job yet |
 
+## Demo
+
+https://github.com/user-attachments/assets/d69aeffc-eccc-4f1f-8b59-1bfa58b652fe
+
 ## What's left
 
 See `docs/ROADMAP.md` for phase checklist. Main gaps: domain allowlist enforcement, retention job, auto-approve, merge patterns, real auth (currently single `DEV_USER_ID`).
