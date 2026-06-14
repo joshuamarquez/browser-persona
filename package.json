@@ -1,0 +1,24 @@
+{
+  "name": "browser-persona",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:api": "npm run dev -w @browser-persona/api",
+    "dev:web": "npm run dev -w @browser-persona/web",
+    "build:extension": "npm run build -w @browser-persona/extension",
+    "typecheck": "npm run typecheck -ws --if-present",
+    "test": "npm run test -ws --if-present",
+    "playwright:install": "npx playwright install chromium",
+    "docker:db-web": "docker compose stop api 2>/dev/null || true && docker compose up -d db web",
+    "docker:exec": "npm run docker:db-web && DATABASE_URL=postgres://persona:persona@localhost:5432/browser_persona npm run dev:api",
+    "docker:up": "docker compose up --build",
+    "docker:up:detached": "docker compose up --build -d",
+    "docker:dev": "docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build",
+    "docker:dev:detached": "docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build -d",
+    "docker:down": "docker compose down",
+    "docker:reset": "docker compose down -v"
+  }
+}

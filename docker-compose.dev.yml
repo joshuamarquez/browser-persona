@@ -1,0 +1,24 @@
+# Dev overlay: hot reload without rebuilding the image
+# Usage: docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+# ports: !override replaces base 3000:80 so we don't double-bind host :3000
+
+services:
+  api:
+    command: ["npm", "run", "dev", "-w", "@browser-persona/api"]
+    volumes:
+      - ./apps/api/src:/app/apps/api/src
+      - ./packages:/app/packages
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile.dev
+    command: ["npm", "run", "dev", "-w", "@browser-persona/web", "--", "--host", "0.0.0.0", "--port", "3000"]
+    environment:
+      VITE_API_BASE: ${VITE_API_BASE:-http://localhost:3001}
+    volumes:
+      - ./apps/web/src:/app/apps/web/src
+      - ./apps/web/index.html:/app/apps/web/index.html
+      - ./apps/web/vite.config.ts:/app/apps/web/vite.config.ts
+    ports: !override
+      - "3000:3000"

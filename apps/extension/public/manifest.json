@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Browser Persona Recorder",
+  "version": "0.1.0",
+  "description": "Capture browser workflows for capability learning",
+  "permissions": ["storage", "activeTab"],
+  "host_permissions": [
+    "http://localhost:3001/*",
+    "http://127.0.0.1:3001/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*/*", "http://localhost/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Browser Persona",
+    "default_popup": "popup.html"
+  }
+}
