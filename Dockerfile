@@ -11,8 +11,8 @@ COPY package.json package-lock.json ./
 COPY apps/api/package.json ./apps/api/
 COPY packages/shared/package.json ./packages/shared/
 COPY packages/event-normalizer/package.json ./packages/event-normalizer/
-COPY packages/pattern-miner/package.json ./packages/pattern-miner/
 COPY packages/playwright-executor/package.json ./packages/playwright-executor/
+COPY packages/intent-executor/package.json ./packages/intent-executor/
 
 RUN npm install
 

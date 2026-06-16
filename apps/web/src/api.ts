@@ -1,7 +1,8 @@
 import type {
   Capability,
   CapabilityDetail,
-  Pattern,
+  CapabilityRun,
+  IntentWorkflowSummary,
   Proposal,
   ReplayEventsResponse,
   RunCapabilityResult,
@@ -38,12 +39,17 @@ export function fetchProposals(): Promise<{ proposals: Proposal[] }> {
   return request('/proposals');
 }
 
-export function fetchPatterns(): Promise<{ patterns: Pattern[] }> {
-  return request('/patterns');
+export function fetchIntentWorkflows(): Promise<{ workflows: IntentWorkflowSummary[] }> {
+  return request('/workflows/intent');
 }
 
 export function fetchCapabilities(): Promise<{ capabilities: Capability[] }> {
   return request('/capabilities');
+}
+
+export function fetchCapabilityRuns(capabilityId?: string): Promise<{ runs: CapabilityRun[] }> {
+  const query = capabilityId ? `?capabilityId=${encodeURIComponent(capabilityId)}` : '';
+  return request(`/capabilities/runs${query}`);
 }
 
 export function fetchCapability(capabilityId: string): Promise<{ capability: CapabilityDetail }> {
@@ -99,13 +105,6 @@ export function approveProposal(
 
 export function rejectProposal(proposalId: string): Promise<{ rejected: boolean }> {
   return request(`/proposals/${proposalId}/reject`, { method: 'POST' });
-}
-
-export function labelPattern(patternId: string): Promise<{ proposalId: string }> {
-  return request('/llm/label-workflow', {
-    method: 'POST',
-    body: JSON.stringify({ patternId }),
-  });
 }
 
 export function runPipeline(): Promise<Record<string, unknown>> {

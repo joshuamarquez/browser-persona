@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { fingerprintSteps, normalizeEvents, segmentWorkflows, filterNoiseSteps, collapseRedundantNavigates } from './index.ts';
+import { fingerprintSteps, normalizeEvents, segmentSemanticSteps, segmentWorkflows, filterNoiseSteps, collapseRedundantNavigates } from './index.ts';
 
 const TS = 1_700_000_000_000;
 const IDLE_GAP_MS = 90_000;
@@ -442,4 +442,17 @@ test('segmentWorkflows still splits on idle gap', () => {
 
   const segments = segmentWorkflows(events);
   assert.equal(segments.length, 2);
+});
+
+test('segmentSemanticSteps splits on idle gap between steps', () => {
+  const t0 = new Date(TS).toISOString();
+  const t1 = new Date(TS + IDLE_GAP_MS + 1).toISOString();
+  const segments = segmentSemanticSteps([
+    { action: 'navigate', url: 'https://app.example.com/a', occurredAt: t0 },
+    { action: 'click', target: { text: 'Go' }, url: 'https://app.example.com/a', occurredAt: t0 },
+    { action: 'navigate', url: 'https://app.example.com/b', occurredAt: t1 },
+  ]);
+  assert.equal(segments.length, 2);
+  assert.equal(segments[0].steps.length, 2);
+  assert.equal(segments[1].steps.length, 1);
 });

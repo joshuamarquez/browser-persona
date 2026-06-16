@@ -7,6 +7,7 @@ mkdirSync('dist', { recursive: true });
 cpSync('public/manifest.json', 'dist/manifest.json');
 cpSync('public/popup.html', 'dist/popup.html');
 cpSync('public/popup.js', 'dist/popup.js');
+cpSync('public/icon128.png', 'dist/icon128.png');
 
 const options = {
   entryPoints: {

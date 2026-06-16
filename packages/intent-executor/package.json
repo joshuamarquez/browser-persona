@@ -1,0 +1,21 @@
+{
+  "name": "@browser-persona/intent-executor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/interpolate.test.ts src/verify.test.ts src/snapshot.test.ts src/run.test.ts"
+  },
+  "dependencies": {
+    "@browser-persona/playwright-executor": "file:../playwright-executor",
+    "@browser-persona/shared": "file:../shared",
+    "playwright": "^1.52.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}

@@ -6,133 +6,76 @@ Status as of the current codebase. Checked = shipped; unchecked = not yet wired 
 
 - [x] PostgreSQL schema applied (`db/schema.sql`)
 - [x] Shared TypeScript types (`packages/shared`)
-- [x] API health check + ingest endpoint
-- [x] Extension records rrweb on allowed hosts (all `https://*/*` + localhost — no allowlist enforcement yet)
+- [x] API health check + ingest endpoints (`/ingest/events`, `/ingest/semantic-steps`)
+- [x] Chrome extension (full rrweb or semantic-only capture)
 
 ## Phase 1 — Capture pipeline
 
-### Extension behavior
+### Extension
 
-1. On tab load, inject rrweb `record()` (no domain allowlist check yet)
-2. Buffer events locally (10 events or 3s in content script; background chunks for ingest)
-3. Flush batch to `POST /ingest/events`
-4. Mask password inputs before emit
-5. Pause/resume via extension popup
+1. Record in **full** mode (rrweb) or **semantic** mode (compact steps only)
+2. Flush to API; mask password inputs
+3. Pause/resume and capture mode in popup
+4. On tab close: end session, poll automation offers, show notification
 
-### Ingest API contract (current)
+### Pipeline
 
-```http
-POST /ingest/events
-Content-Type: application/json
+1. Close idle sessions → segment → `workflows` + `workflow_steps`
+2. `extractIntent()` per workflow when `INTENT_EXTRACT_AUTO=true`
+3. Intent dedup + optional auto-approve
+4. Purge stale rrweb payloads (`RRWEB_RETENTION_DAYS`)
 
-{
-  "sessionId": "uuid",
-  "events": [ /* rrweb events */ ],
-  "meta": { "url": "...", "tabId": 1 }
-}
-```
+- [x] `@browser-persona/event-normalizer` — rrweb or semantic steps → segments
+- [x] Fingerprints stored on `workflows` (for display/debug; not used for promotion)
 
-> Planned: `Authorization: Bearer <user_token>` — not implemented; API uses `DEV_USER_ID`.
+## Phase 2 — Intent executor
 
-### Success criteria
+- [x] `packages/intent-executor` — task loop, verification, LLM replan
+- [x] `POST /capabilities/:id/run` uses intent path when `tasks.length > 0`
+- [x] Plan cache learning on successful replans
+- [x] Legacy `step_template` replay + repair suggestion when no tasks
 
-- [x] Full session stored in `rrweb_events`
-- [x] Replay works in review UI for workflow examples
+## Phase 3 — Review UI
 
----
+- [x] **Inbox** — intent proposals (tasks, risk, verifications)
+- [x] **Workflows** — captured journeys, pipeline controls, replay (full capture only)
+- [x] **Library** — approved capabilities, run history, manual run
+- [x] Approve / edit & approve / reject
 
-## Phase 2 — Normalization
+## Phase 4 — Product (extension + data)
 
-Convert rrweb incremental events into `workflow_steps`:
-
-| rrweb source | Semantic step |
-|---|---|
-| Meta + full snapshot | `navigate` |
-| MouseInteraction click | `click` |
-| Input value change | `fill` |
-| Selection change | `select` |
-| significant scroll | `scroll` |
-| form submit / navigation | boundary for segmentation |
-
-### Segmentation rules
-
-- Start workflow on `navigate` or idle gap > 90s
-- End on: idle gap > 90s, tab close, or cross-origin navigation (same-site page changes stay in one journey)
-- Ignore: mousemove-only noise, scroll-only micro adjustments, unlabeled icon clicks (`svg`, empty `div`)
-
-### Fingerprint
-
-```text
-navigate:crm.example.com/reports|click:text=Weekly Sales|fill:Start Date|fill:End Date|click:text=Export CSV
-```
-
-- [x] Implemented in `@browser-persona/event-normalizer`
-- [x] Stored in `workflows.fingerprint`
-
----
-
-## Phase 3 — Pattern mining
-
-Auto pipeline (default every 60s + debounced after session end), or `POST /pipeline/run` / `POST /pipeline/reprocess`:
-
-1. Group workflows by fingerprint (exact + fuzzy clustering)
-2. Find near-miss pairs (same domain, subsequence-aligned steps, different length/noise)
-3. LLM adjudicates borderline pairs → merge clusters when confidence ≥ 0.7
-4. Count occurrences per user
-5. If count >= `PATTERN_MIN_OCCURRENCES` (default 3), upsert `workflow_patterns`
-6. Mark member workflows as `candidate`
-
-- [x] Exact + fuzzy match (`@browser-persona/pattern-miner`)
-- [x] LLM merge for near-miss pairs (`apps/api/src/llm-merge.ts`, opt-out via `LLM_PATTERN_MERGE=false`)
-
----
-
-## Phase 4 — LLM labeling
-
-```http
-POST /llm/label-workflow
-{ "patternId": "uuid" }
-```
-
-Returns proposal stored in `labeling_proposals`. Human reviews in UI.
-
-- [x] Labeling API + proposal storage
-- [ ] Auto-approve (confidence >= 0.85, sensitive-domain guard, user opt-in)
-
----
-
-## Phase 5 — Review UI
-
-- [x] **Inbox:** unreviewed proposals
-- [x] **Patterns:** frequency, replay, manual label, run pipeline, reprocess all
-- [x] **Library:** approved capabilities grouped by `category_path`
-- [x] Approve / Edit name+category / Reject
-- [ ] Merge (LLM returns `merge_with_pattern_ids`; no UI/API yet)
-
----
-
-## Phase 6 — Execution
-
-- [x] Export approved capability to Playwright script (`GET …/playwright`)
-- [x] Run headful with per-step validation checkpoints (`POST …/run`)
-- [x] On failure, DOM snapshot + LLM repair suggestion
-
----
+- [x] Semantic capture mode (smaller ingest)
+- [x] Extension “Automate this journey?” notification
+- [x] Extension “Run saved workflow” from popup
+- [x] `capability_runs` history table + UI
+- [x] Removed pattern mining (`workflow_patterns`, `@browser-persona/pattern-miner`)
 
 ## Privacy & policy (partial)
 
 | Item | Status |
 |---|---|
 | Password masking at capture | Done |
-| Pause/resume toggle | Done |
-| `recording_policies` domain allowlist | Schema + seed only |
-| 30-day raw event retention | Schema only — no purge job |
+| Pause/resume + capture mode | Done |
+| `recording_policies` domain allowlist | Schema + seed only — not enforced in extension |
+| rrweb retention purge | Done (`RRWEB_RETENTION_DAYS`) |
 
----
+## Not yet implemented
+
+- [ ] Auth / multi-user (`DEV_USER_ID` only today)
+- [ ] `recording_policies` enforcement in extension
+- [ ] `custom_assert` verification kind in executor
+- [ ] Editable task verifications in Inbox before approve
+- [ ] Replay for semantic-only sessions (no rrweb stored)
 
 ## Non-goals for MVP
 
 - Cross-browser support (Chrome only)
-- Full autonomous agent at runtime
+- Full autonomous agent without checkpoints
 - rrweb replay as production executor
 - Multi-user org admin / RBAC
+- Cron / scheduled capability runs (use external scheduler + `POST /capabilities/:id/run` if needed)
+
+## Removed (legacy)
+
+- Fingerprint pattern mining (`workflow_patterns`, `PATTERN_MIN_OCCURRENCES`, `LLM_PATTERN_MERGE`)
+- `labelPattern()` / `POST /llm/label-workflow`

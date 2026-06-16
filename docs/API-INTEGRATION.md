@@ -5,22 +5,25 @@ How capture, pipeline, labeling, review, and execution fit together.
 ## End-to-end flow
 
 ```text
-1. Extension captures rrweb events
-2. POST /ingest/events
+1. Extension captures rrweb events (full mode) or semantic steps (semantic mode)
+2. POST /ingest/events  OR  POST /ingest/semantic-steps
 3. POST /sessions/:sessionId/end   (extension, on tab close)
 4. Pipeline (automatic, default every 60s + debounced ~5s after session end):
      - close idle sessions → recording_sessions.ended_at
      - segment ended sessions → workflows + workflow_steps
-     - mine patterns:
-         a. code clusters by fingerprint (exact + fuzzy)
-         b. LLM adjudicates near-miss pairs (extra/missing steps) when OPENAI_API_KEY is set
-         c. promote if count >= PATTERN_MIN_OCCURRENCES (default 3)
+     - extract intent (when `INTENT_EXTRACT_AUTO=true` and OpenAI key set):
+         one LLM call per new workflow → dedup vs existing capabilities → auto-approve or inbox proposal
+     - purge stale rrweb payloads (`RRWEB_RETENTION_DAYS`) after workflows exist
    Or manually: POST /pipeline/run
-   After normalizer changes: POST /pipeline/reprocess (re-segment all + re-mine)
-5. POST /llm/label-workflow     (one API call per pattern)
-6. Human reviews in UI (Inbox / Patterns / Library)
-7. POST /capabilities/approve
-8. GET /capabilities/:id/playwright  or  POST /capabilities/:id/run
+   After normalizer changes: POST /pipeline/reprocess (re-segment all + re-extract)
+5. Extension polls GET /sessions/:sessionId/automation-offers → notification
+6. Intent proposals appear in Inbox automatically, or trigger manually:
+     POST /workflows/:workflowId/extract-intent
+     POST /llm/extract-intent  `{ "workflowId": "uuid" }`
+7. Human reviews in UI (Inbox / Workflows / Library)
+8. POST /capabilities/approve  (stores `tasks[]` for intent proposals)
+9. GET /capabilities/:id/playwright  or  POST /capabilities/:id/run
+10. GET /capabilities/runs — run history with per-task breakdown
 ```
 
 ## Example curl sequence
@@ -28,20 +31,21 @@ How capture, pipeline, labeling, review, and execution fit together.
 ```bash
 # Ingest + session end happen automatically from the extension.
 
-# Run pipeline on demand (close idle → segment → mine)
+# Run pipeline on demand (close idle → segment → extract intent)
 curl -X POST http://localhost:3001/pipeline/run
 
-# Re-segment all sessions and re-mine (after normalizer/miner changes)
+# Re-segment all sessions (after normalizer changes)
 curl -X POST http://localhost:3001/pipeline/reprocess
+
+# Extract intent for one workflow (manual)
+curl -X POST http://localhost:3001/workflows/<workflow-uuid>/extract-intent
+
+curl -X POST http://localhost:3001/llm/extract-intent \
+  -H 'Content-Type: application/json' \
+  -d '{"workflowId":"<workflow-uuid>"}'
 
 # Or run steps individually:
 curl -X POST http://localhost:3001/workflows/segment/<session-uuid>
-curl -X POST http://localhost:3001/patterns/mine
-
-# Label one pattern (returns JSON proposal)
-curl -X POST http://localhost:3001/llm/label-workflow \
-  -H 'Content-Type: application/json' \
-  -d '{"patternId":"<pattern-uuid>"}'
 
 # Approve (optionally edit name/category)
 curl -X POST http://localhost:3001/capabilities/approve \
@@ -51,100 +55,116 @@ curl -X POST http://localhost:3001/capabilities/approve \
 # List approved capabilities
 curl http://localhost:3001/capabilities
 
-# Replay (workflow-scoped; used by Patterns tab)
+# Replay (workflow-scoped; full capture only)
 curl http://localhost:3001/workflows/<workflow-uuid>/replay-events
 
 # Export Playwright script
 curl -O http://localhost:3001/capabilities/<capability-uuid>/playwright
 
-# Run headful with checkpoints (+ optional LLM repair on failure)
+# Run capability (intent tasks or legacy step replay)
+curl -X POST http://localhost:3001/capabilities/<capability-uuid>/run \
+  -H 'Content-Type: application/json' \
+  -d '{"parameters":{"start_date":"2026-06-01","confirm_dangerous":true},"headless":false}'
+
+# Legacy pattern capabilities still support suggestRepair on failure:
 curl -X POST http://localhost:3001/capabilities/<capability-uuid>/run \
   -H 'Content-Type: application/json' \
   -d '{"parameters":{"start_date":"2026-06-01"},"headless":false,"suggestRepair":true}'
 
 # Review UI also uses:
 curl http://localhost:3001/proposals
-curl http://localhost:3001/patterns
+curl http://localhost:3001/workflows/intent
 curl -X POST http://localhost:3001/proposals/<proposal-uuid>/reject
+curl http://localhost:3001/capabilities/runs
 ```
 
-## LLM request shape (internal)
+## LLM request shape (intent extraction)
 
-The API sends the pattern miner output to OpenAI:
+Compact semantic steps from `workflow_steps` are sent to OpenAI via `extractIntent` (see `apps/api/src/llm-intent.ts`). Steps are compacted with `compactWorkflowSteps()` from `apps/api/src/compact-steps.ts`.
+
+### Intent workflow (preferred)
+
+After segmentation, `extractIntent` stores an `IntentWorkflow` in `intent_proposals.proposal`:
 
 ```json
 {
-  "pattern_id": "uuid",
-  "fingerprint": "navigate:...|click:...",
-  "occurrence_count": 12,
-  "domains": ["crm.example.com"],
-  "step_template": [
-    {"action": "navigate", "url": "https://crm.example.com/reports"},
-    {"action": "click", "target": {"text": "Weekly Sales"}},
-    {"action": "fill", "target": {"name": "start_date"}, "value": "2026-06-01"}
-  ]
-}
-```
-
-## LLM response shape (stored + shown in review UI)
-
-```json
-{
-  "capability_name": "Export weekly sales report",
-  "category_path": ["Reporting", "Sales"],
+  "name": "Export weekly sales report",
   "description": "Opens the weekly sales report and exports CSV for a date range.",
+  "category_path": ["Reporting", "Sales"],
+  "domain": "crm.example.com",
   "parameters": [
-    {"name": "start_date", "type": "date", "example": "2026-06-01"},
-    {"name": "end_date", "type": "date", "example": "2026-06-07"}
+    {"name": "start_date", "type": "date", "example": "2026-06-01"}
   ],
-  "merge_with_pattern_ids": [],
+  "tasks": [
+    {
+      "id": "t1",
+      "order": 1,
+      "goal": "Open the Reports area",
+      "verification": {"kind": "url_contains", "description": "URL includes /reports"},
+      "risk": "low"
+    }
+  ],
+  "is_automatable": true,
   "confidence": 0.91,
-  "reasoning": "Repeated report navigation and export with varying dates."
+  "reasoning": "Clear navigation and export sequence."
 }
 ```
 
-`merge_with_pattern_ids` is stored but not acted on yet (no merge UI/API). Workflow-level near-miss merging during mining is handled separately by `LLM_PATTERN_MERGE` (see Cost control).
+Approve copies `tasks` and `source_workflow_id` into `capabilities`.
 
-## LLM pattern merge (internal)
+## Intent extraction (internal)
 
-During `POST /patterns/mine`, `POST /pipeline/run`, or `POST /pipeline/reprocess`, the API may call OpenAI for **near-miss workflow pairs** — same domain, similar intent, but different step counts or noise clicks that code clustering missed.
+Called once per segmented workflow when `INTENT_EXTRACT_AUTO=true` (default). Compact semantic steps are sent to OpenAI; output is Zod-validated as `IntentWorkflow`. Workflows with `is_automatable: false` are skipped by default (`INTENT_EXTRACT_SKIP_NON_AUTOMATABLE=true`).
 
-Input (compact step lists per workflow):
+Pipeline responses include `intentsExtracted`, `intentsDeduped`, and `intentsAutoApproved` when intent extraction ran.
 
-```json
-{
-  "workflow_a": {
-    "id": "uuid",
-    "domain": "www.google.com",
-    "steps": [
-      {"action": "navigate", "url": "www.google.com/"},
-      {"action": "fill", "target": "Buscar", "value": "fifa world cup 2026"},
-      {"action": "click", "target": "Estadísticas"},
-      {"action": "click", "target": "Compartir vínculo"}
-    ]
-  },
-  "workflow_b": { "...": "..." }
-}
-```
+## Intent dedup and auto-approve (Phase 3)
 
-Response:
+After `extractIntent`, the pipeline compares the new intent to approved capabilities on the same domain using OpenAI embeddings (`name + task goals + domain`):
 
-```json
-{
-  "same_pattern": true,
-  "confidence": 0.92,
-  "reasoning": "Both workflows search FIFA stats and copy a share link; B has one extra menu click."
-}
-```
+| Similarity | Behavior |
+|---|---|
+| ≥ `INTENT_DEDUP_SIMILARITY_HIGH` (0.92) | Link workflow to existing capability; skip inbox |
+| `INTENT_DEDUP_SIMILARITY_LOW`–high (0.80–0.92) | Optional LLM confirm (`INTENT_DEDUP_LLM_CONFIRM`) |
+| Below low | New proposal (or auto-approve if eligible) |
 
-Clusters merge when `same_pattern` is true and `confidence >= 0.7`. Pipeline responses include `llmMergePairsJudged` and `llmMergePairsMerged` when merge ran.
+Auto-approve creates an approved capability when `confidence ≥ INTENT_AUTO_APPROVE_CONFIDENCE` (0.85), max task risk ≤ medium, and domain is not in `INTENT_AUTO_APPROVE_DOMAIN_BLOCKLIST`.
+
+On successful LLM-planned runs, `POST /capabilities/:id/run` persists updated `reference_hint` and `metadata.plan_cache[taskId]` so later runs need fewer planner calls.
+
+Pattern mining (`workflow_patterns`, fingerprint clustering) was removed in Phase 4. Intent extraction runs on every journey.
+
+## Extension semantic capture (Phase 4)
+
+Set **Capture mode → Semantic only** in the extension popup. The content script records clicks, fills, and navigations as compact steps via `POST /ingest/semantic-steps` instead of full rrweb payloads. Segmentation uses `segmentSemanticSteps()` when semantic steps exist for a session.
+
+After tab close, the extension polls `GET /sessions/:sessionId/automation-offers` and shows a notification when a capability or inbox proposal is ready. The popup also lists approved capabilities with a **Run** button (`POST /capabilities/:id/run`).
+
+## Intent execution (Phase 2)
+
+When `capabilities.tasks` is non-empty, `POST /capabilities/:id/run` uses the intent executor:
+
+1. For each task (in order): try `reference_hint` → verify
+2. On failure: LLM `planTask` with interactive DOM snapshot → execute → verify (up to `INTENT_RUN_MAX_PLAN_CALLS_PER_TASK`, default 3)
+3. High-risk tasks require `parameters.confirm_dangerous: true`
+
+Response includes `taskResults` (per-task status, attempts, plannerUsed) and `plannerCalls`. Legacy capabilities without tasks still use fixed `step_template` replay and optional `suggestRepair`.
+
+Manual QA fixture: `packages/intent-executor/fixtures/intent-demo.html` — run package tests with `npm run test -w @browser-persona/intent-executor`.
+
+## Run history (Phase 4)
+
+Each `POST /capabilities/:id/run` records a row in `capability_runs` (status, parameters, `task_results`, planner call count). List via `GET /capabilities/runs?capabilityId=uuid`.
+
+Scheduled/cron runs are **not** built in — trigger runs manually (API, Library, or extension popup) or use an external scheduler calling `POST /capabilities/:id/run`.
 
 ## Cost control
 
-- Label **patterns**, not every session (1 call per unique workflow type)
-- Default model: `gpt-4.1-mini` (~$0.001–0.01 per pattern)
-- **Pattern merge:** LLM judges only *near-miss* workflow pairs that code clustering missed (capped by `LLM_PATTERN_MERGE_MAX_PAIRS`, default 30 per mining run). Disabled when `LLM_PATTERN_MERGE=false` or no API key.
-- Repair suggestions use a separate LLM call only when a Playwright run fails
+- **Intent extract:** 1 LLM call per segmented workflow (not per event)
+- **Intent dedup:** embedding comparison per workflow; LLM confirm only in uncertain band
+- **Semantic capture:** no rrweb storage — smaller ingest payloads
+- Default model: `gpt-4.1-mini` (~$0.001–0.01 per workflow)
+- Repair suggestions use a separate LLM call only when a legacy Playwright run fails
 
 ## Security
 
@@ -168,11 +188,11 @@ Without Docker:
 npm run dev:web            # http://localhost:3000 (API on :3001)
 ```
 
-Tabs: **Inbox** · **Patterns** · **Library**
+Tabs: **Inbox** · **Workflows** · **Library**
 
-- **Inbox** — approve / edit & approve / reject labeling proposals
-- **Patterns** — mined repeats, workflow replay, run pipeline / reprocess all, manual label
-- **Library** — approved capabilities; export Playwright or run headful
+- **Inbox** — approve / edit & approve / reject intent proposals (tasks + verifications)
+- **Workflows** — captured journeys, pipeline controls, replay
+- **Library** — approved capabilities; run history, export Playwright, run headful
 
 `VITE_API_BASE` defaults to `http://localhost:3001` (browser → host-mapped API port).
 
@@ -186,27 +206,35 @@ curl http://localhost:3001/health
 
 Database is initialized automatically from `db/schema.sql` and `db/seed-dev.sql` on first run.
 
-**Existing database volumes** created before `segmented_at` was added to `schema.sql`: apply once:
+To reset the database after schema changes:
 
 ```bash
-docker compose exec -T db psql -U persona -d browser_persona < db/migrations/002_pipeline.sql
+npm run docker:reset
+npm run docker:up
 ```
-
-Fresh installs (`docker compose up` on a new volume) already include this column — skip the migration.
 
 ### Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `OPENAI_API_KEY` | — | Required for labeling, pattern merge, and repair suggestions |
+| `OPENAI_API_KEY` | — | Required for intent extraction, dedup embeddings, planner, and repair |
 | `OPENAI_MODEL` | `gpt-4.1-mini` | LLM model |
 | `DEV_USER_ID` | `00000000-…0001` | Single dev user (no real auth yet) |
 | `PIPELINE_IDLE_MS` | `90000` | Mark session ended after this many ms with no new events |
 | `PIPELINE_INTERVAL_MS` | `60000` | Auto-run interval (ms) |
 | `PIPELINE_AUTO_RUN` | `true` | Set `false` to disable background pipeline |
-| `LLM_PATTERN_MERGE` | `true` | Set `false` to skip LLM adjudication during pattern mining |
-| `LLM_PATTERN_MERGE_MAX_PAIRS` | `30` | Max near-miss workflow pairs sent to LLM per mining run |
-| `PATTERN_MIN_OCCURRENCES` | `3` | Minimum repeats before a cluster becomes a pattern |
+| `INTENT_EXTRACT_AUTO` | `true` | Extract intent after each segmented workflow |
+| `INTENT_EXTRACT_SKIP_NON_AUTOMATABLE` | `true` | Skip inbox proposals when LLM sets `is_automatable: false` |
+| `INTENT_PROMPT_VERSION` | `v1` | Audit tag for intent extraction prompts |
+| `INTENT_RUN_MAX_PLAN_CALLS_PER_TASK` | `3` | Max LLM planner calls per task during run |
+| `INTENT_DOM_SNAPSHOT_MAX_CHARS` | `10000` | Cap interactive DOM snapshot for planner |
+| `INTENT_AUTO_APPROVE_CONFIDENCE` | `0.85` | Auto-approve when confidence ≥ threshold and max risk ≤ medium |
+| `INTENT_DEDUP_SIMILARITY_HIGH` | `0.92` | Embedding similarity to link workflow to existing capability |
+| `INTENT_DEDUP_SIMILARITY_LOW` | `0.80` | Below = always new intent; between low and high = optional LLM confirm |
+| `INTENT_DEDUP_LLM_CONFIRM` | `true` | LLM confirm for uncertain dedup band |
+| `INTENT_AUTO_APPROVE_DOMAIN_BLOCKLIST` | — | Comma-separated domains blocked from auto-approve |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model for intent dedup |
+| `RRWEB_RETENTION_DAYS` | `14` | Purge rrweb payloads after this many days (workflows kept) |
 | `INGEST_BODY_LIMIT_MB` | `25` | Max POST body size for `/ingest/events` |
 | `PLAYWRIGHT_HEADLESS` | `false` (host) / `true` (Docker) | Headless browser for `/capabilities/:id/run` |
 | `PLAYWRIGHT_SLOW_MO` | `50` | Slow motion ms between Playwright actions |

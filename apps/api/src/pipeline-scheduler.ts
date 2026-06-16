@@ -9,7 +9,8 @@ function logPipelineResult(logger: FastifyBaseLogger, result: PipelineRunResult)
   if (
     result.sessionsClosed > 0 ||
     result.sessionsSegmented > 0 ||
-    result.patternsFound > 0
+    result.workflowsCreated > 0 ||
+    result.intentsExtracted > 0
   ) {
     logger.info(result, 'pipeline run completed');
   }
@@ -25,7 +26,16 @@ export function runPipelineNow(userId: string, logger: FastifyBaseLogger): Promi
     })
     .catch((err) => {
       logger.error(err, 'pipeline run failed');
-      throw err;
+      return {
+        sessionsClosed: 0,
+        sessionsSegmented: 0,
+        workflowsCreated: 0,
+        intentsExtracted: 0,
+        intentsDeduped: 0,
+        intentsAutoApproved: 0,
+        sessionIds: [],
+        workflowIds: [],
+      };
     })
     .finally(() => {
       inFlight = null;
@@ -34,7 +44,7 @@ export function runPipelineNow(userId: string, logger: FastifyBaseLogger): Promi
   return inFlight;
 }
 
-/** Debounced run after a session ends so patterns appear without waiting for the interval. */
+/** Debounced run after a session ends so intents appear without waiting for the interval. */
 export function schedulePipelineRun(userId: string, logger: FastifyBaseLogger): void {
   if (debounceId != null) clearTimeout(debounceId);
   debounceId = setTimeout(() => {

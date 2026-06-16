@@ -474,3 +474,37 @@ export function segmentWorkflows(events: StoredEvent[]): WorkflowSegment[] {
 
   return segments;
 }
+
+/** Split pre-normalized semantic steps into workflows by idle gap. */
+export function segmentSemanticSteps(steps: SemanticStep[]): WorkflowSegment[] {
+  if (steps.length === 0) return [];
+
+  const normalized = collapseRedundantNavigates(collapseDuplicateSteps(filterNoiseSteps(steps)));
+  const segments: WorkflowSegment[] = [];
+  let buffer: SemanticStep[] = [];
+
+  const flush = () => {
+    if (buffer.length === 0) return;
+    const firstUrl = buffer.find((s) => s.url)?.url ?? '';
+    segments.push({
+      steps: buffer,
+      startedAt: buffer[0].occurredAt,
+      endedAt: buffer[buffer.length - 1].occurredAt,
+      primaryDomain: firstUrl ? domainFromUrl(firstUrl) : '',
+      fingerprint: fingerprintSteps(buffer),
+    });
+    buffer = [];
+  };
+
+  for (const step of normalized) {
+    if (buffer.length > 0) {
+      const prevTs = new Date(buffer[buffer.length - 1].occurredAt).getTime();
+      const curTs = new Date(step.occurredAt).getTime();
+      if (curTs - prevTs > IDLE_GAP_MS) flush();
+    }
+    buffer.push(step);
+  }
+  flush();
+
+  return segments;
+}

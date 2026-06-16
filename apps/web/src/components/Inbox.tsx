@@ -1,11 +1,18 @@
 import { useState } from 'react';
-import type { Proposal } from '../types';
+import type { Proposal, TaskRisk } from '../types';
+import { proposalDisplayName } from '../types';
 import { approveProposal, rejectProposal } from '../api';
-import { formatCategory, formatConfidence, formatSteps, parseCategoryInput } from '../utils';
+import { formatCategory, formatConfidence, parseCategoryInput } from '../utils';
 
 interface Props {
   proposals: Proposal[];
   onUpdated: () => void;
+}
+
+function riskBadgeClass(risk: TaskRisk): string {
+  if (risk === 'high') return 'badge risk-high';
+  if (risk === 'medium') return 'badge risk-medium';
+  return 'badge risk-low';
 }
 
 export function Inbox({ proposals, onUpdated }: Props) {
@@ -18,7 +25,7 @@ export function Inbox({ proposals, onUpdated }: Props) {
 
   function openEdit(p: Proposal) {
     setEditing(p);
-    setName(p.proposal.capability_name);
+    setName(proposalDisplayName(p.proposal));
     setDescription(p.proposal.description);
     setCategory(p.proposal.category_path.join(' > '));
     setError(null);
@@ -64,7 +71,9 @@ export function Inbox({ proposals, onUpdated }: Props) {
     return (
       <div className="empty">
         <p>No proposals waiting for review.</p>
-        <p className="muted">Label a pattern from the Patterns tab, or run the pipeline after recording.</p>
+        <p className="muted">
+          Intent proposals appear after pipeline segmentation when you record a journey with the extension.
+        </p>
       </div>
     );
   }
@@ -72,68 +81,79 @@ export function Inbox({ proposals, onUpdated }: Props) {
   return (
     <div className="stack">
       {error && <div className="banner error">{error}</div>}
-      {proposals.map((p) => (
-        <article key={p.id} className="card">
-          <header className="card-header">
-            <div>
-              <div className="eyebrow">{formatCategory(p.proposal.category_path)}</div>
-              <h2>{p.proposal.capability_name}</h2>
+      {proposals.map((p) => {
+        const displayName = proposalDisplayName(p.proposal);
+
+        return (
+          <article key={p.id} className="card">
+            <header className="card-header">
+              <div>
+                <div className="eyebrow">{formatCategory(p.proposal.category_path)}</div>
+                <h2>{displayName}</h2>
+              </div>
+              <span className="badge">{formatConfidence(Number(p.confidence))}</span>
+            </header>
+
+            <p className="description">{p.proposal.description}</p>
+
+            <dl className="meta">
+              <div>
+                <dt>Domain</dt>
+                <dd>{p.proposal.domain}</dd>
+              </div>
+            </dl>
+
+            <div className="task-list">
+              <strong>Tasks</strong>
+              <ol>
+                {p.proposal.tasks.map((task) => (
+                  <li key={task.id}>
+                    <span>{task.goal}</span>
+                    <span className={riskBadgeClass(task.risk)}>{task.risk}</span>
+                    <span className="muted small">
+                      verify: {task.verification.kind} — {task.verification.description}
+                    </span>
+                  </li>
+                ))}
+              </ol>
             </div>
-            <span className="badge">{formatConfidence(Number(p.confidence))}</span>
-          </header>
 
-          <p className="description">{p.proposal.description}</p>
+            {p.proposal.parameters.length > 0 && (
+              <p className="params">
+                <strong>Parameters:</strong>{' '}
+                {p.proposal.parameters.map((param) => param.name).join(', ')}
+              </p>
+            )}
 
-          <dl className="meta">
-            <div>
-              <dt>Seen</dt>
-              <dd>{p.occurrence_count ?? '—'} times</dd>
+            <details className="reasoning">
+              <summary>LLM reasoning</summary>
+              <p>{p.proposal.reasoning}</p>
+            </details>
+
+            <div className="actions">
+              <button
+                type="button"
+                className="primary"
+                disabled={busy === p.id}
+                onClick={() => handleApprove(p, false)}
+              >
+                Approve
+              </button>
+              <button type="button" disabled={busy === p.id} onClick={() => openEdit(p)}>
+                Edit &amp; approve
+              </button>
+              <button
+                type="button"
+                className="danger"
+                disabled={busy === p.id}
+                onClick={() => handleReject(p.id)}
+              >
+                Reject
+              </button>
             </div>
-            <div>
-              <dt>Domains</dt>
-              <dd>{p.domains?.join(', ') || '—'}</dd>
-            </div>
-          </dl>
-
-          <p className="steps">
-            <strong>Steps:</strong> {formatSteps(p.step_template)}
-          </p>
-
-          {p.proposal.parameters.length > 0 && (
-            <p className="params">
-              <strong>Parameters:</strong>{' '}
-              {p.proposal.parameters.map((param) => param.name).join(', ')}
-            </p>
-          )}
-
-          <details className="reasoning">
-            <summary>LLM reasoning</summary>
-            <p>{p.proposal.reasoning}</p>
-          </details>
-
-          <div className="actions">
-            <button
-              type="button"
-              className="primary"
-              disabled={busy === p.id}
-              onClick={() => handleApprove(p, false)}
-            >
-              Approve
-            </button>
-            <button type="button" disabled={busy === p.id} onClick={() => openEdit(p)}>
-              Edit &amp; approve
-            </button>
-            <button
-              type="button"
-              className="danger"
-              disabled={busy === p.id}
-              onClick={() => handleReject(p.id)}
-            >
-              Reject
-            </button>
-          </div>
-        </article>
-      ))}
+          </article>
+        );
+      })}
 
       {editing && (
         <div className="modal-backdrop" onClick={() => setEditing(null)}>
