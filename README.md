@@ -1,6 +1,6 @@
 # Browser Persona
 
-Learn how a person uses the web, detect repeated workflows, label them with an LLM, and store reproducible capabilities.
+Learn how a person uses the web, capture journeys, extract intent with an LLM, and store reproducible capabilities.
 
 ## Architecture
 
@@ -33,7 +33,7 @@ Learn how a person uses the web, detect repeated workflows, label them with an L
 browser-persona/
 ├── apps/
 │   ├── extension/          # Chrome MV3 recorder
-│   ├── api/                # Ingest + pipeline + label + review + run API
+│   ├── api/                # Ingest + pipeline + intent + review + run API
 │   └── web/                # Review dashboard
 ├── packages/
 │   ├── shared/             # Shared TypeScript types
@@ -44,8 +44,7 @@ browser-persona/
 │   ├── schema.sql
 │   └── seed-dev.sql
 └── docs/
-    ├── API-INTEGRATION.md
-    └── ROADMAP.md
+    └── API-INTEGRATION.md
 ```
 
 ## Quick start (Docker Compose — recommended)
@@ -132,9 +131,9 @@ For headful capability runs locally: `npm run playwright:install` once, then use
 
 ## Typical workflow
 
-1. Record the same workflow 3+ times in Chrome (close the tab after each visit).
-2. Pipeline runs automatically (~60s interval, or ~5s after tab close) to segment sessions and mine patterns (code clustering + optional LLM merge for near-misses).
-3. Open **Patterns** in the review UI → **Label** a pattern → review in **Inbox**. Use **Reprocess all** after normalizer/miner code changes.
+1. Record a workflow in Chrome (full rrweb or semantic-only capture).
+2. Pipeline runs automatically (~60s interval, or ~5s after tab close) to segment sessions and extract intent.
+3. Review proposals in **Inbox** (or wait for auto-approve on high-confidence intents). Use **Reprocess all** after normalizer or intent extraction changes.
 4. **Approve** to add to **Library** → **Export Playwright** or **Run headful**.
 
 ## Privacy
@@ -144,7 +143,7 @@ For headful capability runs locally: `npm run playwright:install` once, then use
 | Password fields masked at capture | Implemented |
 | Pause/resume recording (extension popup) | Implemented |
 | Domain allowlist | Schema only — not enforced yet |
-| 30-day raw event retention | Schema only — no purge job yet |
+| rrweb payload retention | Implemented (`RRWEB_RETENTION_DAYS`, default 14 days) |
 
 ## Demo
 

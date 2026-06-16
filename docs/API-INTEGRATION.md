@@ -1,6 +1,6 @@
 # API Integration Guide
 
-How capture, pipeline, labeling, review, and execution fit together.
+How capture, pipeline, intent extraction, review, and execution fit together.
 
 ## End-to-end flow
 
@@ -61,15 +61,10 @@ curl http://localhost:3001/workflows/<workflow-uuid>/replay-events
 # Export Playwright script
 curl -O http://localhost:3001/capabilities/<capability-uuid>/playwright
 
-# Run capability (intent tasks or legacy step replay)
+# Run capability
 curl -X POST http://localhost:3001/capabilities/<capability-uuid>/run \
   -H 'Content-Type: application/json' \
   -d '{"parameters":{"start_date":"2026-06-01","confirm_dangerous":true},"headless":false}'
-
-# Legacy pattern capabilities still support suggestRepair on failure:
-curl -X POST http://localhost:3001/capabilities/<capability-uuid>/run \
-  -H 'Content-Type: application/json' \
-  -d '{"parameters":{"start_date":"2026-06-01"},"headless":false,"suggestRepair":true}'
 
 # Review UI also uses:
 curl http://localhost:3001/proposals
@@ -132,8 +127,6 @@ Auto-approve creates an approved capability when `confidence ≥ INTENT_AUTO_APP
 
 On successful LLM-planned runs, `POST /capabilities/:id/run` persists updated `reference_hint` and `metadata.plan_cache[taskId]` so later runs need fewer planner calls.
 
-Pattern mining (`workflow_patterns`, fingerprint clustering) was removed in Phase 4. Intent extraction runs on every journey.
-
 ## Extension semantic capture (Phase 4)
 
 Set **Capture mode → Semantic only** in the extension popup. The content script records clicks, fills, and navigations as compact steps via `POST /ingest/semantic-steps` instead of full rrweb payloads. Segmentation uses `segmentSemanticSteps()` when semantic steps exist for a session.
@@ -148,7 +141,7 @@ When `capabilities.tasks` is non-empty, `POST /capabilities/:id/run` uses the in
 2. On failure: LLM `planTask` with interactive DOM snapshot → execute → verify (up to `INTENT_RUN_MAX_PLAN_CALLS_PER_TASK`, default 3)
 3. High-risk tasks require `parameters.confirm_dangerous: true`
 
-Response includes `taskResults` (per-task status, attempts, plannerUsed) and `plannerCalls`. Legacy capabilities without tasks still use fixed `step_template` replay and optional `suggestRepair`.
+Response includes `taskResults` (per-task status, attempts, plannerUsed) and `plannerCalls`.
 
 Manual QA fixture: `packages/intent-executor/fixtures/intent-demo.html` — run package tests with `npm run test -w @browser-persona/intent-executor`.
 
@@ -164,7 +157,7 @@ Scheduled/cron runs are **not** built in — trigger runs manually (API, Library
 - **Intent dedup:** embedding comparison per workflow; LLM confirm only in uncertain band
 - **Semantic capture:** no rrweb storage — smaller ingest payloads
 - Default model: `gpt-4.1-mini` (~$0.001–0.01 per workflow)
-- Repair suggestions use a separate LLM call only when a legacy Playwright run fails
+- Planner calls are capped per task (`INTENT_RUN_MAX_PLAN_CALLS_PER_TASK`)
 
 ## Security
 

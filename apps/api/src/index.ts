@@ -189,7 +189,7 @@ app.post('/sessions/:sessionId/end', async (req, reply) => {
   return reply.send({ sessionId, ended: true });
 });
 
-/** Run pipeline: close idle sessions → segment → mine patterns. */
+/** Run pipeline: close idle sessions → segment → extract intent. */
 app.post('/pipeline/run', async (_req, reply) => {
   const result = await runPipelineNow(DEV_USER_ID, app.log);
   return reply.send(result);
@@ -351,7 +351,7 @@ app.get('/workflows/intent', async (_req, reply) => {
   return reply.send({ workflows });
 });
 
-/** Workflow-scoped replay events for pattern example playback. */
+/** Workflow-scoped replay events for review UI playback. */
 app.get('/workflows/:workflowId/replay-events', async (req, reply) => {
   const { workflowId } = req.params as { workflowId: string };
   try {

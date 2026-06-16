@@ -120,7 +120,7 @@ export function sliceReplayEvents(
   return normalizeForReplayer(slice);
 }
 
-/** rrweb events for one workflow segment (pattern example replay). */
+/** rrweb events for one workflow segment (review UI replay). */
 export async function getWorkflowReplayEvents(
   workflowId: string,
   userId: string,
