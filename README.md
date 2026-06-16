@@ -148,8 +148,5 @@ For headful capability runs locally: `npm run playwright:install` once, then use
 
 ## Demo
 
-https://github.com/user-attachments/assets/d69aeffc-eccc-4f1f-8b59-1bfa58b652fe
+https://github.com/user-attachments/assets/b7c4dad5-6a93-4ed9-b9b8-05cdabf63fd5
 
-## What's left
-
-See `docs/ROADMAP.md` for phase checklist. Main gaps: domain allowlist enforcement, retention job, auto-approve, merge patterns, real auth (currently single `DEV_USER_ID`).
