@@ -5,24 +5,22 @@ Learn how a person uses the web, detect repeated workflows, label them with an L
 ## Architecture
 
 ```text
-[Chrome Extension] --rrweb events--> [Ingest API]
+[Chrome Extension] --rrweb or semantic steps--> [Ingest API]
                                            |
                                     [PostgreSQL]
                                            |
-                              [Pipeline: segment + pattern miner + LLM merge]
-                                           |
-                              [LLM Labeler API endpoint]
+                              [Pipeline: segment + extractIntent + dedup]
                                            |
                               [Review UI] --> [Capability Library]
                                            |
-                              [Playwright Executor + LLM repair]
+                              [Intent Executor + run history]
 ```
 
 ## Stack
 
 | Layer | Tech |
 |---|---|
-| Capture | Chrome extension + rrweb |
+| Capture | Chrome extension (full rrweb or semantic-only mode) |
 | Backend | Node.js + Fastify |
 | Database | PostgreSQL |
 | LLM | OpenAI structured JSON (swap-friendly) |
@@ -39,13 +37,12 @@ browser-persona/
 │   └── web/                # Review dashboard
 ├── packages/
 │   ├── shared/             # Shared TypeScript types
-│   ├── event-normalizer/   # rrweb -> semantic steps
-│   ├── pattern-miner/      # Frequent sequence detection (fuzzy + LLM near-miss merge)
+│   ├── event-normalizer/   # rrweb or semantic steps -> workflows
+│   ├── intent-executor/    # Task loop + verification + LLM replan
 │   └── playwright-executor/ # Export + run approved capabilities
 ├── db/
 │   ├── schema.sql
-│   ├── seed-dev.sql
-│   └── migrations/         # One-off upgrades for existing volumes
+│   └── seed-dev.sql
 └── docs/
     ├── API-INTEGRATION.md
     └── ROADMAP.md
@@ -129,7 +126,7 @@ For headful capability runs locally: `npm run playwright:install` once, then use
 | Command | Purpose |
 |---|---|
 | `npm run typecheck` | TypeScript across all workspaces |
-| `npm run test` | Unit tests (normalizer, miner, replay, executor) |
+| `npm run test` | Unit tests (normalizer, intent-executor, replay, API) |
 | `npm run build:extension` | Build Chrome extension to `apps/extension/dist` |
 | `npm run docker:exec` | DB + web in Docker, API on host (for visible browser) |
 

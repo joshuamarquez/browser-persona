@@ -3,19 +3,23 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { z } from 'zod';
 import { query, withTransaction } from './db.js';
-import { getModelName, labelPattern, PROMPT_VERSION } from './llm.js';
 import {
   endRecordingSession,
-  minePatterns,
+  extractIntentForWorkflow,
   reprocessAllSessions,
   segmentSession,
 } from './pipeline.js';
 import { runPipelineNow, schedulePipelineRun, startPipelineAutoRun } from './pipeline-scheduler.js';
-import { listPatterns, listProposals, rejectProposal } from './review.js';
+import { approveProposal, listIntentWorkflows, listProposals, rejectProposal } from './review.js';
+import { extractIntent, getIntentModelName, INTENT_PROMPT_VERSION } from './llm-intent.js';
 import { getWorkflowReplayEvents } from './replay.js';
-import { getCapability } from './executor.js';
+import { getCapability, findCapabilityStartUrl, persistIntentLearning } from './executor.js';
 import { suggestRepair } from './llm-repair.js';
+import { planTask } from './llm-plan.js';
 import { exportPlaywrightScript, runCapability } from '@browser-persona/playwright-executor';
+import { runIntentCapability } from '@browser-persona/intent-executor';
+import { getAutomationOffersForSession } from './automation-offers.js';
+import { listCapabilityRuns, recordCapabilityRun } from './capability-runs.js';
 
 const DEFAULT_INGEST_BODY_LIMIT_MB = 25;
 
@@ -86,6 +90,85 @@ app.post('/ingest/events', { bodyLimit: ingestBodyLimit }, async (req, reply) =>
   return reply.send({ accepted, sessionId: body.sessionId });
 });
 
+const SemanticStepSchema = z.object({
+  action: z.enum(['navigate', 'click', 'fill', 'select', 'scroll', 'submit', 'wait']),
+  target: z.record(z.unknown()).optional(),
+  value: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional(),
+  url: z.string().optional(),
+  occurredAt: z.string(),
+});
+
+const SemanticIngestSchema = z.object({
+  sessionId: z.string().uuid(),
+  steps: z.array(SemanticStepSchema).min(1),
+  meta: z.object({
+    url: z.string(),
+    tabId: z.number().optional(),
+    title: z.string().optional(),
+    captureMode: z.literal('semantic').optional(),
+  }),
+});
+
+/** Compact semantic steps from extension (captureMode=semantic; no rrweb). */
+app.post('/ingest/semantic-steps', async (req, reply) => {
+  const body = SemanticIngestSchema.parse(req.body);
+
+  await withTransaction(async (client) => {
+    await client.query(
+      `INSERT INTO recording_sessions (id, user_id, started_at, metadata)
+       VALUES ($1, $2, now(), $3)
+       ON CONFLICT (id) DO UPDATE SET metadata = recording_sessions.metadata || EXCLUDED.metadata`,
+      [
+        body.sessionId,
+        DEV_USER_ID,
+        JSON.stringify({ capture_mode: 'semantic', last_url: body.meta.url }),
+      ],
+    );
+
+    await client.query(`SELECT id FROM recording_sessions WHERE id = $1 FOR UPDATE`, [
+      body.sessionId,
+    ]);
+
+    const startIdx = await client.query<{ next: number }>(
+      `SELECT COALESCE(MAX(step_index), -1) + 1 AS next FROM session_semantic_steps WHERE session_id = $1`,
+      [body.sessionId],
+    );
+    let stepIndex = startIdx.rows[0]?.next ?? 0;
+
+    for (const step of body.steps) {
+      await client.query(
+        `INSERT INTO session_semantic_steps (session_id, step_index, action, target, value, url, occurred_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          body.sessionId,
+          stepIndex++,
+          step.action,
+          JSON.stringify(step.target ?? {}),
+          step.value != null ? JSON.stringify(step.value) : null,
+          step.url ?? null,
+          step.occurredAt,
+        ],
+      );
+    }
+  });
+
+  return reply.send({ accepted: body.steps.length, sessionId: body.sessionId });
+});
+
+/** Automation offers for a session (extension notification after pipeline). */
+app.get('/sessions/:sessionId/automation-offers', async (req, reply) => {
+  const { sessionId } = req.params as { sessionId: string };
+  const exists = await query<{ id: string }>(
+    `SELECT id FROM recording_sessions WHERE id = $1 AND user_id = $2`,
+    [sessionId, DEV_USER_ID],
+  );
+  if (exists.length === 0) {
+    return reply.status(404).send({ error: 'Session not found' });
+  }
+  const offers = await getAutomationOffersForSession(sessionId, DEV_USER_ID);
+  return reply.send({ sessionId, offers });
+});
+
 /** Mark a recording session as ended (extension tab close). */
 app.post('/sessions/:sessionId/end', async (req, reply) => {
   const { sessionId } = req.params as { sessionId: string };
@@ -112,7 +195,7 @@ app.post('/pipeline/run', async (_req, reply) => {
   return reply.send(result);
 });
 
-/** Re-segment all sessions (force) and re-mine — use after normalizer changes. */
+/** Re-segment all sessions (force) — use after normalizer changes. */
 app.post('/pipeline/reprocess', async (_req, reply) => {
   const result = await reprocessAllSessions(DEV_USER_ID);
   return reply.send(result);
@@ -138,53 +221,94 @@ app.post('/workflows/segment/:sessionId', async (req, reply) => {
   }
 });
 
-/** Mine patterns from raw workflows */
-app.post('/patterns/mine', async (_req, reply) => {
-  const result = await minePatterns(DEV_USER_ID);
-  return reply.send(result);
-});
+/** Manual intent extraction for one workflow */
+app.post('/workflows/:workflowId/extract-intent', async (req, reply) => {
+  const { workflowId } = req.params as { workflowId: string };
 
-/** Single LLM API call to label a mined pattern */
-app.post('/llm/label-workflow', async (req, reply) => {
-  const { patternId } = z.object({ patternId: z.string().uuid() }).parse(req.body);
-
-  const patterns = await query<{
-    id: string;
-    fingerprint: string;
-    occurrence_count: number;
-    domains: string[];
-    step_template: unknown[];
-  }>(
-    `SELECT id, fingerprint, occurrence_count, domains, step_template
-     FROM workflow_patterns WHERE id = $1 AND user_id = $2`,
-    [patternId, DEV_USER_ID],
+  const exists = await query<{ id: string }>(
+    `SELECT id FROM workflows WHERE id = $1 AND user_id = $2`,
+    [workflowId, DEV_USER_ID],
   );
-
-  if (patterns.length === 0) {
-    return reply.status(404).send({ error: 'Pattern not found' });
+  if (exists.length === 0) {
+    return reply.status(404).send({ error: 'Workflow not found' });
   }
 
-  const pattern = patterns[0];
-  const proposal = await labelPattern({
-    patternId: pattern.id,
-    fingerprint: pattern.fingerprint,
-    occurrenceCount: pattern.occurrence_count,
-    domains: pattern.domains,
-    stepTemplate: pattern.step_template as unknown[],
-  });
+  try {
+    const intent = await extractIntent(workflowId, DEV_USER_ID);
+    const saved = await query<{ id: string }>(
+      `INSERT INTO intent_proposals (workflow_id, proposal, confidence, llm_model, prompt_version)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
+      [
+        workflowId,
+        JSON.stringify(intent),
+        intent.confidence,
+        getIntentModelName(),
+        INTENT_PROMPT_VERSION,
+      ],
+    );
 
-  const saved = await query<{ id: string }>(
-    `INSERT INTO labeling_proposals (workflow_id, pattern_id, proposal, confidence, llm_model, prompt_version)
-     SELECT example_workflow_id, $1, $2, $3, $4, $5
-     FROM workflow_patterns WHERE id = $1
-     RETURNING id`,
-    [patternId, JSON.stringify(proposal), proposal.confidence, getModelName(), PROMPT_VERSION],
+    await query(`UPDATE workflows SET status = 'intent_extracted' WHERE id = $1`, [workflowId]);
+
+    return reply.send({
+      proposalId: saved[0].id,
+      workflowId,
+      proposal: intent,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.includes('OPENAI_API_KEY')) {
+      return reply.status(503).send({ error: message });
+    }
+    throw err;
+  }
+});
+
+/** LLM extract intent alias */
+app.post('/llm/extract-intent', async (req, reply) => {
+  const { workflowId } = z.object({ workflowId: z.string().uuid() }).parse(req.body);
+
+  const exists = await query<{ id: string }>(
+    `SELECT id FROM workflows WHERE id = $1 AND user_id = $2`,
+    [workflowId, DEV_USER_ID],
+  );
+  if (exists.length === 0) {
+    return reply.status(404).send({ error: 'Workflow not found' });
+  }
+
+  const result = await extractIntentForWorkflow(workflowId, DEV_USER_ID, { force: true });
+  if (result.skipped && result.reason === 'non_automatable') {
+    return reply.send({
+      workflowId,
+      skipped: true,
+      reason: result.reason,
+      message: 'Workflow marked as not automatable; no proposal created',
+    });
+  }
+  if (result.skipped && result.reason === 'already_proposed') {
+    return reply.send({
+      workflowId,
+      skipped: true,
+      reason: result.reason,
+      proposalId: result.proposalId,
+    });
+  }
+  if (result.skipped) {
+    return reply.status(503).send({
+      error: result.reason === 'no_api_key' ? 'OPENAI_API_KEY is not configured' : 'Intent extraction disabled',
+      reason: result.reason,
+    });
+  }
+
+  const proposals = await query<{ proposal: unknown }>(
+    `SELECT proposal FROM intent_proposals WHERE id = $1`,
+    [result.proposalId],
   );
 
   return reply.send({
-    proposalId: saved[0].id,
-    patternId,
-    proposal,
+    proposalId: result.proposalId,
+    workflowId,
+    proposal: proposals[0]?.proposal,
   });
 });
 
@@ -203,58 +327,15 @@ app.post('/capabilities/approve', async (req, reply) => {
     })
     .parse(req.body);
 
-  const proposals = await query<{
-    id: string;
-    pattern_id: string;
-    proposal: {
-      capability_name: string;
-      category_path: string[];
-      description: string;
-      parameters: unknown[];
-      confidence: number;
-    };
-    llm_model: string;
-    prompt_version: string;
-  }>(`SELECT * FROM labeling_proposals WHERE id = $1`, [body.proposalId]);
-
-  if (proposals.length === 0) {
-    return reply.status(404).send({ error: 'Proposal not found' });
+  try {
+    const result = await approveProposal(body.proposalId, DEV_USER_ID, body.edits);
+    return reply.send(result);
+  } catch (err) {
+    if (err instanceof Error && err.message === 'Proposal not found') {
+      return reply.status(404).send({ error: 'Proposal not found' });
+    }
+    throw err;
   }
-
-  const p = proposals[0];
-  const name = body.edits?.name ?? p.proposal.capability_name;
-  const categoryPath = body.edits?.category_path ?? p.proposal.category_path;
-  const description = body.edits?.description ?? p.proposal.description;
-
-  const patterns = await query<{ step_template: unknown[] }>(
-    `SELECT step_template FROM workflow_patterns WHERE id = $1`,
-    [p.pattern_id],
-  );
-
-  const cap = await query<{ id: string }>(
-    `INSERT INTO capabilities (user_id, pattern_id, status, name, description, category_path, parameters, step_template, confidence, llm_model, llm_prompt_version, approved_at, approved_by)
-     VALUES ($1, $2, 'approved', $3, $4, $5, $6, $7, $8, $9, $10, now(), $1)
-     RETURNING id`,
-    [
-      DEV_USER_ID,
-      p.pattern_id,
-      name,
-      description,
-      categoryPath,
-      JSON.stringify(p.proposal.parameters),
-      JSON.stringify(patterns[0]?.step_template ?? []),
-      p.proposal.confidence,
-      p.llm_model,
-      p.prompt_version,
-    ],
-  );
-
-  await query(
-    `UPDATE labeling_proposals SET reviewed = true, review_decision = 'approve', reviewed_at = now() WHERE id = $1`,
-    [body.proposalId],
-  );
-
-  return reply.send({ capabilityId: cap[0].id });
 });
 
 /** Inbox: labeling proposals awaiting review */
@@ -264,10 +345,10 @@ app.get('/proposals', async (req, reply) => {
   return reply.send({ proposals });
 });
 
-/** Mined workflow patterns */
-app.get('/patterns', async (_req, reply) => {
-  const patterns = await listPatterns(DEV_USER_ID);
-  return reply.send({ patterns });
+/** Intent-extracted workflows */
+app.get('/workflows/intent', async (_req, reply) => {
+  const workflows = await listIntentWorkflows(DEV_USER_ID);
+  return reply.send({ workflows });
 });
 
 /** Workflow-scoped replay events for pattern example playback. */
@@ -318,6 +399,13 @@ app.get('/capabilities', async (_req, reply) => {
     [DEV_USER_ID],
   );
   return reply.send({ capabilities: caps });
+});
+
+/** Capability run history */
+app.get('/capabilities/runs', async (req, reply) => {
+  const capabilityId = (req.query as { capabilityId?: string }).capabilityId;
+  const runs = await listCapabilityRuns(DEV_USER_ID, { capabilityId, limit: 50 });
+  return reply.send({ runs });
 });
 
 /** Full capability detail for export/run */
@@ -379,9 +467,6 @@ app.post('/capabilities/:capabilityId/run', async (req, reply) => {
   if (cap.status !== 'approved') {
     return reply.status(400).send({ error: 'Only approved capabilities can be executed' });
   }
-  if (cap.step_template.length === 0) {
-    return reply.status(400).send({ error: 'Capability has no steps to run' });
-  }
 
   const inDocker = process.env.DOCKER_CONTAINER === 'true';
   const wantsHeadful =
@@ -397,14 +482,80 @@ app.post('/capabilities/:capabilityId/run', async (req, reply) => {
   }
 
   const headless = body.headless ?? (inDocker || process.env.PLAYWRIGHT_HEADLESS === 'true');
+  const slowMo = Number(process.env.PLAYWRIGHT_SLOW_MO ?? 50);
+  const timeoutMs = Number(process.env.PLAYWRIGHT_TIMEOUT_MS ?? 30_000);
+  const runStartedAt = new Date();
+
+  if (cap.tasks.length > 0) {
+    try {
+      const result = await runIntentCapability({
+        tasks: cap.tasks,
+        parameters: body.parameters,
+        headless,
+        slowMo,
+        timeoutMs,
+        maxPlanCallsPerTask: Number(process.env.INTENT_RUN_MAX_PLAN_CALLS_PER_TASK ?? 3),
+        domSnapshotMaxChars: Number(process.env.INTENT_DOM_SNAPSHOT_MAX_CHARS ?? 10_000),
+        startUrl: findCapabilityStartUrl(cap.tasks, cap.step_template),
+        planTask: (input) =>
+          planTask({
+            capabilityName: cap.name,
+            ...input,
+          }),
+      });
+
+      if (result.success && result.taskResults?.length) {
+        const learning = result.taskResults
+          .filter((tr) => tr.plannerUsed && tr.learnedHint)
+          .map((tr) => ({
+            taskId: tr.taskId,
+            learnedHint: tr.learnedHint,
+            learnedPlanActions: tr.learnedPlanActions,
+          }));
+        if (learning.length > 0) {
+          await persistIntentLearning(capabilityId, DEV_USER_ID, learning);
+        }
+      }
+
+      const runId = await recordCapabilityRun({
+        capabilityId,
+        userId: DEV_USER_ID,
+        status: result.success ? 'success' : 'failed',
+        parameters: body.parameters,
+        taskResults: result.taskResults,
+        plannerCalls: result.plannerCalls,
+        errorMessage: result.success ? undefined : result.taskResults?.find((t) => t.status === 'failed')?.message,
+        startedAt: runStartedAt,
+      });
+
+      return reply.send({
+        capabilityId,
+        runId,
+        ...result,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes('Executable doesn') || message.includes('browserType.launch')) {
+        const error = inDocker
+          ? 'Playwright browsers are missing in the API container. Rebuild with: docker compose up --build -d api. For a visible browser on macOS, run: npm run docker:exec'
+          : 'Playwright browsers are not installed on this machine. Run: npm run playwright:install';
+        return reply.status(503).send({ error });
+      }
+      throw err;
+    }
+  }
+
+  if (cap.step_template.length === 0) {
+    return reply.status(400).send({ error: 'Capability has no steps or tasks to run' });
+  }
 
   try {
     const result = await runCapability({
       stepTemplate: cap.step_template,
       parameters: body.parameters,
       headless,
-      slowMo: Number(process.env.PLAYWRIGHT_SLOW_MO ?? 50),
-      timeoutMs: Number(process.env.PLAYWRIGHT_TIMEOUT_MS ?? 30_000),
+      slowMo,
+      timeoutMs,
     });
 
     let repair = undefined;
@@ -427,8 +578,18 @@ app.post('/capabilities/:capabilityId/run', async (req, reply) => {
       }
     }
 
+    const runId = await recordCapabilityRun({
+      capabilityId,
+      userId: DEV_USER_ID,
+      status: result.success ? 'success' : 'failed',
+      parameters: body.parameters,
+      errorMessage: result.error,
+      startedAt: runStartedAt,
+    });
+
     return reply.send({
       capabilityId,
+      runId,
       ...result,
       repair,
     });

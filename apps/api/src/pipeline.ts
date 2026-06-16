@@ -1,7 +1,17 @@
-import { segmentWorkflows } from '@browser-persona/event-normalizer';
-import { detectPatterns, detectPatternsWithMerge, type MinerWorkflow } from '@browser-persona/pattern-miner';
-import { compactWorkflowSteps, judgeWorkflowMerge } from './llm-merge.js';
+import { segmentSemanticSteps, segmentWorkflows } from '@browser-persona/event-normalizer';
+import type { SemanticStep } from '@browser-persona/shared';
+import {
+  extractIntent,
+  getIntentModelName,
+  INTENT_PROMPT_VERSION,
+} from './llm-intent.js';
+import { findIntentDedupMatch, linkWorkflowToCapability } from './intent-dedup.js';
+import {
+  createCapabilityFromIntent,
+  isAutoApproveEligible,
+} from './review.js';
 import { query } from './db.js';
+import { purgeStaleRrwebEvents } from './retention.js';
 
 export const DEFAULT_PIPELINE_IDLE_MS = 90_000;
 export const DEFAULT_PIPELINE_INTERVAL_MS = 60_000;
@@ -11,49 +21,55 @@ export function getPipelineIdleMs(): number {
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_PIPELINE_IDLE_MS;
 }
 
-export function getPatternMinOccurrences(): number {
-  const n = Number(process.env.PATTERN_MIN_OCCURRENCES ?? 3);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 3;
-}
-
 export function getPipelineIntervalMs(): number {
   const n = Number(process.env.PIPELINE_INTERVAL_MS ?? DEFAULT_PIPELINE_INTERVAL_MS);
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_PIPELINE_INTERVAL_MS;
 }
 
-export function isLlmPatternMergeEnabled(): boolean {
-  if (process.env.LLM_PATTERN_MERGE === 'false') return false;
+export function isIntentExtractAutoEnabled(): boolean {
+  if (process.env.INTENT_EXTRACT_AUTO === 'false') return false;
   return Boolean(process.env.OPENAI_API_KEY?.trim());
 }
 
-export function getLlmPatternMergeMaxPairs(): number {
-  const n = Number(process.env.LLM_PATTERN_MERGE_MAX_PAIRS ?? 30);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 30;
+export function shouldSkipNonAutomatableIntent(): boolean {
+  return process.env.INTENT_EXTRACT_SKIP_NON_AUTOMATABLE !== 'false';
 }
 
 export interface SegmentSessionResult {
   sessionId: string;
   workflowsCreated: number;
   workflowIds: string[];
-}
-
-export interface MinePatternsResult {
-  patternsFound: number;
-  patternIds: string[];
-  llmMergePairsJudged?: number;
-  llmMergePairsMerged?: number;
+  intentsExtracted: number;
+  intentsDeduped: number;
+  intentsAutoApproved: number;
 }
 
 export interface PipelineRunResult {
   sessionsClosed: number;
   sessionsSegmented: number;
   workflowsCreated: number;
-  patternsFound: number;
+  intentsExtracted: number;
+  intentsDeduped: number;
+  intentsAutoApproved: number;
+  rrwebPurged?: number;
   sessionIds: string[];
   workflowIds: string[];
-  patternIds: string[];
-  llmMergePairsJudged?: number;
-  llmMergePairsMerged?: number;
+}
+
+export interface ExtractIntentResult {
+  workflowId: string;
+  skipped: boolean;
+  reason?:
+    | 'non_automatable'
+    | 'already_proposed'
+    | 'no_api_key'
+    | 'disabled'
+    | 'deduped'
+    | 'auto_approved'
+    | 'llm_failed';
+  proposalId?: string;
+  capabilityId?: string;
+  dedupSimilarity?: number;
 }
 
 /** Mark sessions idle with no recent events as ended (uses last event timestamp). */
@@ -99,11 +115,125 @@ export async function endRecordingSession(
   return rows.length > 0;
 }
 
+
+/** Extract intent for one workflow and persist a labeling proposal. */
+export async function extractIntentForWorkflow(
+  workflowId: string,
+  userId: string,
+  options?: { force?: boolean },
+): Promise<ExtractIntentResult> {
+  if (!options?.force && !isIntentExtractAutoEnabled()) {
+    return { workflowId, skipped: true, reason: 'disabled' };
+  }
+
+  if (!process.env.OPENAI_API_KEY?.trim()) {
+    return { workflowId, skipped: true, reason: 'no_api_key' };
+  }
+
+  const pending = await query<{ id: string }>(
+    `SELECT id FROM intent_proposals
+     WHERE workflow_id = $1 AND reviewed = false`,
+    [workflowId],
+  );
+  if (pending.length > 0) {
+    return { workflowId, skipped: true, reason: 'already_proposed', proposalId: pending[0].id };
+  }
+
+  const intent = await extractIntent(workflowId, userId).catch((err) => {
+    console.error(`intent extraction failed for workflow ${workflowId}:`, err);
+    return null;
+  });
+  if (!intent) {
+    return { workflowId, skipped: true, reason: 'llm_failed' };
+  }
+
+  if (!intent.is_automatable && shouldSkipNonAutomatableIntent()) {
+    return { workflowId, skipped: true, reason: 'non_automatable' };
+  }
+
+  const dedup = await findIntentDedupMatch(userId, intent);
+  if (dedup.matched && dedup.match) {
+    await linkWorkflowToCapability(workflowId, dedup.match.capabilityId);
+    return {
+      workflowId,
+      skipped: true,
+      reason: 'deduped',
+      capabilityId: dedup.match.capabilityId,
+      dedupSimilarity: dedup.match.similarity,
+    };
+  }
+
+  if (isAutoApproveEligible(intent)) {
+    const { capabilityId } = await createCapabilityFromIntent(userId, workflowId, intent, {
+      confidence: intent.confidence,
+      llmModel: getIntentModelName(),
+      promptVersion: INTENT_PROMPT_VERSION,
+    });
+    await query(`UPDATE workflows SET status = 'intent_extracted' WHERE id = $1`, [workflowId]);
+    return {
+      workflowId,
+      skipped: true,
+      reason: 'auto_approved',
+      capabilityId,
+    };
+  }
+
+  const saved = await query<{ id: string }>(
+    `INSERT INTO intent_proposals (workflow_id, proposal, confidence, llm_model, prompt_version)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id`,
+    [
+      workflowId,
+      JSON.stringify(intent),
+      intent.confidence,
+      getIntentModelName(),
+      INTENT_PROMPT_VERSION,
+    ],
+  );
+
+  await query(`UPDATE workflows SET status = 'intent_extracted' WHERE id = $1`, [workflowId]);
+
+  return {
+    workflowId,
+    skipped: false,
+    proposalId: saved[0].id,
+  };
+}
+
+export async function extractIntentForWorkflows(
+  workflowIds: string[],
+  userId: string,
+): Promise<{
+  extracted: number;
+  deduped: number;
+  autoApproved: number;
+  results: ExtractIntentResult[];
+}> {
+  const results: ExtractIntentResult[] = [];
+  let extracted = 0;
+  let deduped = 0;
+  let autoApproved = 0;
+
+  for (const workflowId of workflowIds) {
+    const result = await extractIntentForWorkflow(workflowId, userId);
+    results.push(result);
+    if (!result.skipped && result.proposalId) {
+      extracted += 1;
+    } else if (result.reason === 'deduped') {
+      deduped += 1;
+    } else if (result.reason === 'auto_approved') {
+      autoApproved += 1;
+    }
+  }
+
+  return { extracted, deduped, autoApproved, results };
+}
+
 /** Segment one session into workflows. Idempotent via segmented_at. */
 export async function segmentSession(
   sessionId: string,
   userId: string,
-  options?: { force?: boolean },
+  options?: { force?: boolean; extractIntent?: boolean },
 ): Promise<SegmentSessionResult> {
   const existing = await query<{ segmented_at: string | null }>(
     `SELECT segmented_at FROM recording_sessions WHERE id = $1 AND user_id = $2`,
@@ -123,15 +253,13 @@ export async function segmentSession(
       sessionId,
       workflowsCreated: 0,
       workflowIds: workflows.map((w) => w.id),
+      intentsExtracted: 0,
+      intentsDeduped: 0,
+      intentsAutoApproved: 0,
     };
   }
 
   if (options?.force) {
-    await query(
-      `UPDATE workflow_patterns SET example_workflow_id = NULL
-       WHERE example_workflow_id IN (SELECT id FROM workflows WHERE session_id = $1)`,
-      [sessionId],
-    );
     await query(`DELETE FROM workflows WHERE session_id = $1`, [sessionId]);
     await query(
       `UPDATE recording_sessions SET segmented_at = NULL WHERE id = $1 AND user_id = $2`,
@@ -139,18 +267,42 @@ export async function segmentSession(
     );
   }
 
-  const rows = await query<{ payload: object; timestamp_ms: number }>(
-    `SELECT payload, timestamp_ms FROM rrweb_events
-     WHERE session_id = $1 ORDER BY seq ASC`,
+  const semanticRows = await query<{
+    action: string;
+    target: object;
+    value: unknown;
+    url: string | null;
+    occurred_at: string;
+  }>(
+    `SELECT action, target, value, url, occurred_at
+     FROM session_semantic_steps WHERE session_id = $1 ORDER BY step_index`,
     [sessionId],
   );
 
-  const events = rows.map((r) => ({
-    ...(r.payload as { type: number; timestamp: number; data?: unknown }),
-    timestamp: (r.payload as { timestamp: number }).timestamp ?? r.timestamp_ms,
-  }));
+  let segments;
+  if (semanticRows.length > 0) {
+    const steps: SemanticStep[] = semanticRows.map((r) => ({
+      action: r.action as SemanticStep['action'],
+      target: r.target as SemanticStep['target'],
+      value: r.value as SemanticStep['value'],
+      url: r.url ?? undefined,
+      occurredAt: r.occurred_at,
+    }));
+    segments = segmentSemanticSteps(steps);
+  } else {
+    const rows = await query<{ payload: object; timestamp_ms: number }>(
+      `SELECT payload, timestamp_ms FROM rrweb_events
+       WHERE session_id = $1 ORDER BY seq ASC`,
+      [sessionId],
+    );
 
-  const segments = segmentWorkflows(events);
+    const events = rows.map((r) => ({
+      ...(r.payload as { type: number; timestamp: number; data?: unknown }),
+      timestamp: (r.payload as { timestamp: number }).timestamp ?? r.timestamp_ms,
+    }));
+
+    segments = segmentWorkflows(events);
+  }
   const created: string[] = [];
 
   for (const seg of segments) {
@@ -194,142 +346,28 @@ export async function segmentSession(
     [sessionId, userId],
   );
 
-  return { sessionId, workflowsCreated: created.length, workflowIds: created };
-}
-
-async function loadWorkflowStepsForOne(
-  workflowId: string,
-): Promise<Array<{ action: string; target: object; value: unknown; url: string | null }>> {
-  return query<{ action: string; target: object; value: unknown; url: string | null }>(
-    `SELECT action, target, value, url FROM workflow_steps
-     WHERE workflow_id = $1 ORDER BY step_index`,
-    [workflowId],
-  );
-}
-
-async function detectPatternsForUser(
-  minerWorkflows: MinerWorkflow[],
-): Promise<{
-  patterns: ReturnType<typeof detectPatterns>;
-  llmMergePairsJudged?: number;
-  llmMergePairsMerged?: number;
-}> {
-  const detectOptions = { minOccurrences: getPatternMinOccurrences() };
-
-  if (!isLlmPatternMergeEnabled()) {
-    return { patterns: detectPatterns(minerWorkflows, detectOptions) };
-  }
-
-  const stepCache = new Map<
-    string,
-    Array<{ action: string; target: object; value: unknown; url: string | null }>
-  >();
-
-  async function stepsFor(workflowId: string) {
-    let steps = stepCache.get(workflowId);
-    if (!steps) {
-      steps = await loadWorkflowStepsForOne(workflowId);
-      stepCache.set(workflowId, steps);
-    }
-    return steps;
-  }
-
-  const result = await detectPatternsWithMerge(
-    minerWorkflows,
-    {
-      ...detectOptions,
-      maxPairs: getLlmPatternMergeMaxPairs(),
-    },
-    async (a, b) => {
-      const [stepsA, stepsB] = await Promise.all([stepsFor(a.id), stepsFor(b.id)]);
-      return judgeWorkflowMerge(
-        { id: a.id, domain: a.primaryDomain, steps: compactWorkflowSteps(stepsA) },
-        { id: b.id, domain: b.primaryDomain, steps: compactWorkflowSteps(stepsB) },
-      );
-    },
-  );
-
-  return {
-    patterns: result.patterns,
-    llmMergePairsJudged: result.pairsJudged,
-    llmMergePairsMerged: result.pairsMerged,
-  };
-}
-
-/** Mine patterns from all workflows for a user. */
-export async function minePatterns(userId: string): Promise<MinePatternsResult> {
-  const workflows = await query<{
-    id: string;
-    fingerprint: string;
-    primary_domain: string;
-    step_count: number;
-    ended_at: string;
-  }>(
-    `SELECT id, fingerprint, primary_domain, step_count, ended_at
-     FROM workflows WHERE user_id = $1 AND fingerprint IS NOT NULL`,
-    [userId],
-  );
-
-  const minerWorkflows: MinerWorkflow[] = workflows.map((w) => ({
-    id: w.id,
-    fingerprint: w.fingerprint,
-    primaryDomain: w.primary_domain,
-    stepCount: w.step_count,
-    lastSeenAt: w.ended_at,
-  }));
-
-  const { patterns: detected, llmMergePairsJudged, llmMergePairsMerged } =
-    await detectPatternsForUser(minerWorkflows);
-
-  const upserted: string[] = [];
-
-  for (const pattern of detected) {
-    const steps = await query<{ action: string; target: object; value: unknown; url: string }>(
-      `SELECT action, target, value, url FROM workflow_steps
-       WHERE workflow_id = $1 ORDER BY step_index`,
-      [pattern.exampleWorkflowId],
-    );
-
-    const row = await query<{ id: string }>(
-      `INSERT INTO workflow_patterns (user_id, fingerprint, occurrence_count, example_workflow_id, step_template, domains, last_seen_at)
-       VALUES ($1, $2, $3, $4, $5, $6, now())
-       ON CONFLICT (user_id, fingerprint) DO UPDATE SET
-         occurrence_count = EXCLUDED.occurrence_count,
-         last_seen_at = now(),
-         step_template = EXCLUDED.step_template
-       RETURNING id`,
-      [
-        userId,
-        pattern.fingerprint,
-        pattern.occurrenceCount,
-        pattern.exampleWorkflowId,
-        JSON.stringify(steps),
-        pattern.domains,
-      ],
-    );
-
-    const patternId = row[0].id;
-    upserted.push(patternId);
-
-    for (const wfId of pattern.workflowIds) {
-      await query(
-        `INSERT INTO workflow_pattern_members (pattern_id, workflow_id) VALUES ($1, $2)
-         ON CONFLICT DO NOTHING`,
-        [patternId, wfId],
-      );
-      await query(`UPDATE workflows SET status = 'candidate' WHERE id = $1`, [wfId]);
-    }
+  const shouldExtract = options?.extractIntent ?? isIntentExtractAutoEnabled();
+  let intentsExtracted = 0;
+  let intentsDeduped = 0;
+  let intentsAutoApproved = 0;
+  if (shouldExtract && created.length > 0) {
+    const extract = await extractIntentForWorkflows(created, userId);
+    intentsExtracted = extract.extracted;
+    intentsDeduped = extract.deduped;
+    intentsAutoApproved = extract.autoApproved;
   }
 
   return {
-    patternsFound: upserted.length,
-    patternIds: upserted,
-    llmMergePairsJudged,
-    llmMergePairsMerged,
+    sessionId,
+    workflowsCreated: created.length,
+    workflowIds: created,
+    intentsExtracted,
+    intentsDeduped,
+    intentsAutoApproved,
   };
 }
 
-/** Re-segment every session with updated normalizer rules, then re-mine patterns. */
+/** Re-segment every session with updated normalizer rules. */
 export async function reprocessAllSessions(userId: string): Promise<PipelineRunResult> {
   const sessions = await query<{ id: string }>(
     `SELECT id FROM recording_sessions WHERE user_id = $1 ORDER BY started_at ASC`,
@@ -339,30 +377,36 @@ export async function reprocessAllSessions(userId: string): Promise<PipelineRunR
   const sessionIds: string[] = [];
   const workflowIds: string[] = [];
   let workflowsCreated = 0;
+  let intentsExtracted = 0;
+  let intentsDeduped = 0;
+  let intentsAutoApproved = 0;
 
   for (const { id } of sessions) {
     const result = await segmentSession(id, userId, { force: true });
     sessionIds.push(id);
     workflowsCreated += result.workflowsCreated;
     workflowIds.push(...result.workflowIds);
+    intentsExtracted += result.intentsExtracted;
+    intentsDeduped += result.intentsDeduped;
+    intentsAutoApproved += result.intentsAutoApproved;
   }
 
-  const mine = await minePatterns(userId);
+  const rrwebPurged = await purgeStaleRrwebEvents().catch(() => 0);
 
   return {
     sessionsClosed: 0,
     sessionsSegmented: sessionIds.length,
     workflowsCreated,
-    patternsFound: mine.patternsFound,
+    intentsExtracted,
+    intentsDeduped,
+    intentsAutoApproved,
+    rrwebPurged,
     sessionIds,
     workflowIds,
-    patternIds: mine.patternIds,
-    llmMergePairsJudged: mine.llmMergePairsJudged,
-    llmMergePairsMerged: mine.llmMergePairsMerged,
   };
 }
 
-/** Close idle sessions, segment finished ones, then mine patterns. */
+/** Close idle sessions, segment finished ones, retention purge. */
 export async function runPipeline(userId: string): Promise<PipelineRunResult> {
   const closedByIdle = await closeIdleSessions(userId);
 
@@ -378,25 +422,31 @@ export async function runPipeline(userId: string): Promise<PipelineRunResult> {
   const sessionIds: string[] = [];
   const workflowIds: string[] = [];
   let workflowsCreated = 0;
+  let intentsExtracted = 0;
+  let intentsDeduped = 0;
+  let intentsAutoApproved = 0;
 
   for (const { id } of pending) {
     const result = await segmentSession(id, userId);
     sessionIds.push(id);
     workflowsCreated += result.workflowsCreated;
     workflowIds.push(...result.workflowIds);
+    intentsExtracted += result.intentsExtracted;
+    intentsDeduped += result.intentsDeduped;
+    intentsAutoApproved += result.intentsAutoApproved;
   }
 
-  const mine = await minePatterns(userId);
+  const rrwebPurged = await purgeStaleRrwebEvents().catch(() => 0);
 
   return {
     sessionsClosed: closedByIdle.length,
     sessionsSegmented: sessionIds.length,
     workflowsCreated,
-    patternsFound: mine.patternsFound,
+    intentsExtracted,
+    intentsDeduped,
+    intentsAutoApproved,
+    rrwebPurged,
     sessionIds,
     workflowIds,
-    patternIds: mine.patternIds,
-    llmMergePairsJudged: mine.llmMergePairsJudged,
-    llmMergePairsMerged: mine.llmMergePairsMerged,
   };
 }

@@ -157,6 +157,42 @@ body {
   color: #92400e;
 }
 
+.badge.risk-high {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.badge.risk-medium {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.badge.risk-low {
+  background: #f4f4f5;
+  color: #3f3f46;
+}
+
+.task-list {
+  margin: 12px 0;
+  color: #3f3f46;
+}
+
+.task-list ol {
+  margin: 8px 0 0;
+  padding-left: 1.25rem;
+}
+
+.task-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.task-list li span:first-child {
+  flex: 1;
+}
+
 .badges {
   display: flex;
   gap: 6px;

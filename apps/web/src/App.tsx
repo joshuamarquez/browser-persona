@@ -1,17 +1,16 @@
 import { useCallback, useEffect, useState } from 'react';
-import { fetchCapabilities, fetchPatterns, fetchProposals } from './api';
+import { fetchCapabilities, fetchProposals } from './api';
 import { Capabilities } from './components/Capabilities';
 import { Inbox } from './components/Inbox';
-import { Patterns } from './components/Patterns';
-import type { Capability, Pattern, Proposal } from './types';
+import { Workflows } from './components/Workflows';
+import type { Capability, Proposal } from './types';
 import './App.css';
 
-type Tab = 'inbox' | 'patterns' | 'library';
+type Tab = 'inbox' | 'workflows' | 'library';
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('inbox');
   const [proposals, setProposals] = useState<Proposal[]>([]);
-  const [patterns, setPatterns] = useState<Pattern[]>([]);
   const [capabilities, setCapabilities] = useState<Capability[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -22,13 +21,8 @@ export default function App() {
     }
     setError(null);
     try {
-      const [proposalRes, patternRes, capRes] = await Promise.all([
-        fetchProposals(),
-        fetchPatterns(),
-        fetchCapabilities(),
-      ]);
+      const [proposalRes, capRes] = await Promise.all([fetchProposals(), fetchCapabilities()]);
       setProposals(proposalRes.proposals);
-      setPatterns(patternRes.patterns);
       setCapabilities(capRes.capabilities);
     } catch (err) {
       if (!options?.silent) {
@@ -47,7 +41,7 @@ export default function App() {
 
   const selectTab = (next: Tab) => {
     setTab(next);
-    if (next === 'patterns' || next === 'inbox') {
+    if (next === 'workflows' || next === 'inbox') {
       void refresh({ silent: true });
     }
   };
@@ -74,10 +68,10 @@ export default function App() {
         </button>
         <button
           type="button"
-          className={tab === 'patterns' ? 'active' : ''}
-          onClick={() => selectTab('patterns')}
+          className={tab === 'workflows' ? 'active' : ''}
+          onClick={() => selectTab('workflows')}
         >
-          Patterns {patterns.length > 0 && <span className="count">{patterns.length}</span>}
+          Workflows
         </button>
         <button
           type="button"
@@ -95,7 +89,7 @@ export default function App() {
         ) : (
           <>
             {tab === 'inbox' && <Inbox proposals={proposals} onUpdated={refresh} />}
-            {tab === 'patterns' && <Patterns patterns={patterns} onUpdated={refresh} />}
+            {tab === 'workflows' && <Workflows />}
             {tab === 'library' && <Capabilities capabilities={capabilities} />}
           </>
         )}

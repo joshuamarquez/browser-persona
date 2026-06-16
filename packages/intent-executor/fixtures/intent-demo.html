@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Intent demo</title>
+  </head>
+  <body>
+    <nav>
+      <a id="usage-link" href="#usage">Usage</a>
+      <a href="#billing">Billing</a>
+    </nav>
+    <main id="usage">
+      <h1>Usage</h1>
+      <button type="button">Export CSV</button>
+    </main>
+    <script>
+      document.getElementById('usage-link')?.addEventListener('click', (e) => {
+        e.preventDefault();
+        history.pushState({}, '', '#usage');
+      });
+    </script>
+  </body>
+</html>

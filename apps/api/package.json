@@ -8,11 +8,11 @@
     "start": "node dist/index.js",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test src/replay.test.ts"
+    "test": "tsx --test src/replay.test.ts src/llm-intent.test.ts src/pipeline-intent.test.ts src/llm-plan.test.ts src/intent-dedup.test.ts src/intent-auto-approve.test.ts src/retention.test.ts"
   },
   "dependencies": {
+    "@browser-persona/intent-executor": "file:../../packages/intent-executor",
     "@browser-persona/event-normalizer": "file:../../packages/event-normalizer",
-    "@browser-persona/pattern-miner": "file:../../packages/pattern-miner",
     "@browser-persona/playwright-executor": "file:../../packages/playwright-executor",
     "@browser-persona/shared": "file:../../packages/shared",
     "@fastify/cors": "^11.0.1",

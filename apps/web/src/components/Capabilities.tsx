@@ -3,6 +3,7 @@ import type { Capability } from '../types';
 import { downloadPlaywrightScript } from '../api';
 import { formatCategory, formatConfidence } from '../utils';
 import { RunCapabilityModal } from './RunCapabilityModal';
+import { RunHistory } from './RunHistory';
 
 interface Props {
   capabilities: Capability[];
@@ -10,7 +11,9 @@ interface Props {
 
 export function Capabilities({ capabilities }: Props) {
   const [runningCapability, setRunningCapability] = useState<Capability | null>(null);
+  const [historyCapabilityId, setHistoryCapabilityId] = useState<string | undefined>(undefined);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [historyKey, setHistoryKey] = useState(0);
 
   const handleExport = async (cap: Capability) => {
     setActionError(null);
@@ -41,6 +44,24 @@ export function Capabilities({ capabilities }: Props) {
   return (
     <div className="stack">
       {actionError && <div className="banner error">{actionError}</div>}
+
+      <section>
+        <div className="toolbar">
+          <strong>Run history</strong>
+          <button
+            type="button"
+            className="ghost"
+            onClick={() => {
+              setHistoryCapabilityId(undefined);
+              setHistoryKey((k) => k + 1);
+            }}
+          >
+            All runs
+          </button>
+        </div>
+        <RunHistory key={historyKey} capabilityId={historyCapabilityId} />
+      </section>
+
       {[...grouped.entries()].map(([category, caps]) => (
         <section key={category}>
           <h2 className="section-title">{category}</h2>
@@ -53,11 +74,11 @@ export function Capabilities({ capabilities }: Props) {
                 </header>
                 <p className="description">{cap.description}</p>
                 <div className="actions">
-                  <button
-                    type="button"
-                    onClick={() => void handleExport(cap)}
-                  >
+                  <button type="button" onClick={() => void handleExport(cap)}>
                     Export Playwright
+                  </button>
+                  <button type="button" onClick={() => setHistoryCapabilityId(cap.id)}>
+                    History
                   </button>
                   <button
                     type="button"

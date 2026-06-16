@@ -115,18 +115,41 @@ export function RunCapabilityModal({ capability, onClose }: Props) {
         {result && (
           <div className="run-results">
             <div className={`banner ${result.success ? 'success' : 'error'}`}>
-              {result.success ? 'All checkpoints passed.' : `Failed at step ${(result.failedAt ?? 0) + 1}.`}
+              {result.success
+                ? result.taskResults
+                  ? `All ${result.taskResults.length} tasks passed.`
+                  : 'All checkpoints passed.'
+                : result.taskResults
+                  ? `Failed at task ${result.failedAt ?? 'unknown'}.`
+                  : `Failed at step ${Number(result.failedAt ?? 0) + 1}.`}
             </div>
-            <ol className="checkpoint-list">
-              {result.checkpoints.map((checkpoint) => (
-                <li key={checkpoint.stepIndex} className={checkpoint.status}>
-                  <span className="checkpoint-action">
-                    {checkpoint.stepIndex + 1}. {checkpoint.action}
-                  </span>
-                  <span className="checkpoint-message">{checkpoint.message}</span>
-                </li>
-              ))}
-            </ol>
+            {result.taskResults ? (
+              <ol className="checkpoint-list">
+                {result.taskResults.map((task) => (
+                  <li key={task.taskId} className={task.status === 'passed' ? 'passed' : task.status}>
+                    <span className="checkpoint-action">{task.goal}</span>
+                    <span className="checkpoint-message">
+                      {task.status}
+                      {task.plannerUsed ? ' (planner)' : ''} — {task.message}
+                    </span>
+                  </li>
+                ))}
+              </ol>
+            ) : (
+              <ol className="checkpoint-list">
+                {(result.checkpoints ?? []).map((checkpoint) => (
+                  <li key={checkpoint.stepIndex} className={checkpoint.status}>
+                    <span className="checkpoint-action">
+                      {checkpoint.stepIndex + 1}. {checkpoint.action}
+                    </span>
+                    <span className="checkpoint-message">{checkpoint.message}</span>
+                  </li>
+                ))}
+              </ol>
+            )}
+            {result.plannerCalls != null && result.plannerCalls > 0 && (
+              <p className="muted small">Planner calls: {result.plannerCalls}</p>
+            )}
             {result.repair && (
               <details className="reasoning">
                 <summary>LLM repair suggestion ({Math.round(result.repair.confidence * 100)}%)</summary>
